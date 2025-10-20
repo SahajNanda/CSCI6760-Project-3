@@ -17,8 +17,11 @@
 #include <openssl/buffer.h>
 #include <fcntl.h>
 
-#define BUFFER_SIZE 512
-#define DNS_PORT 53
+#define BUF_SIZE 8192
+#define DEFAULT_DOH_SERVER "cloudflare-dns.com"
+#define DEFAULT_DOH_PATH "/dns-query"
+#define DEFAULT_DOH_PORT "443"
+#define TEST_PORT 5300  // Non-privileged port for testing
 
 // base64url encoding
 void base64url_encode(const unsigned char *input, int length, char *output) {
@@ -45,7 +48,8 @@ int load_deny_list(const char *filename, char denylist[][256], int max_domains) 
     FILE *file = fopen(filename, "r");
     if (!file) {
         perror("fopen");
-        return -1;
+        fprintf(stderr, "Failed to open deny list file: %s\n", filename);
+        exit(EXIT_FAILURE);
     } // if
     int count = 0;
     while (fgets(denylist[count], 256, file) && count < max_domains) {
@@ -82,112 +86,250 @@ int parse_qname(const unsigned char *dns_query, char *domain) {
     return 0;
 } // parse_qname
 
+int send_doh_query(unsigned char *query, int query_len, unsigned char *response, int *resp_len,
+                   const char *doh_host, const char *doh_path, const char *doh_port) {
+
+    SSL_CTX *ctx;
+    SSL *ssl;
+    BIO *bio;
+    char req_hdr[512];
+    int len, total = 0;
+    unsigned char buffer[BUF_SIZE];
+    const char *header_end;
+    int body_offset;
+
+    ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) {
+        fprintf(stderr, "SSL_CTX_new failed\n");
+        return -1;
+    }
+
+    bio = BIO_new_ssl_connect(ctx);
+    BIO_get_ssl(bio, &ssl);
+    SSL_set_mode(ssl, SSL_MODE_AUTO_RETRY);
+
+    char conn_str[256];
+    snprintf(conn_str, sizeof(conn_str), "%s:%s", doh_host, doh_port);
+    BIO_set_conn_hostname(bio, conn_str);
+
+    if (BIO_do_connect(bio) <= 0) {
+        fprintf(stderr, "Failed to connect to %s\n", doh_host);
+        BIO_free_all(bio);
+        SSL_CTX_free(ctx);
+        return -1;
+    }
+
+    // base64-encode DNS query
+    BIO *b64 = BIO_new(BIO_f_base64());
+    BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
+    BIO *mem = BIO_new(BIO_s_mem());
+    BIO_push(b64, mem);
+    BIO_write(b64, query, query_len);
+    BIO_flush(b64);
+
+    BUF_MEM *bptr;
+    BIO_get_mem_ptr(mem, &bptr);
+
+    // Construct HTTPS request
+    snprintf(req_hdr, sizeof(req_hdr),
+             "POST %s HTTP/1.1\r\n"
+             "Host: %s\r\n"
+             "Content-Type: application/dns-message\r\n"
+             "Accept: application/dns-message\r\n"
+             "Content-Length: %d\r\n"
+             "Connection: close\r\n\r\n",
+             doh_path, doh_host, query_len);
+
+    BIO_write(bio, req_hdr, strlen(req_hdr));
+    BIO_write(bio, query, query_len);
+
+    // Read full response
+    while ((len = BIO_read(bio, buffer + total, sizeof(buffer) - 1 - total)) > 0)
+        total += len;
+
+    buffer[total] = '\0';
+
+    // Find start of DNS message (after HTTP headers)
+    header_end = strstr((char *)buffer, "\r\n\r\n");
+    if (!header_end) {
+        fprintf(stderr, "Malformed HTTP response\n");
+        BIO_free_all(bio);
+        SSL_CTX_free(ctx);
+        BIO_free_all(b64);
+        return -1;
+    }
+
+    body_offset = (header_end + 4) - (char *)buffer;
+    *resp_len = total - body_offset;
+    memcpy(response, buffer + body_offset, *resp_len);
+
+    BIO_free_all(bio);
+    BIO_free_all(b64);
+    SSL_CTX_free(ctx);
+    return 0;
+}
+
+
+void send_nxdomain(int sockfd, struct sockaddr_in *client_addr, socklen_t addr_len, unsigned char *query, int len) {
+    unsigned char response[512];
+    memcpy(response, query, len);
+    response[2] |= 0x80;                    // Set QR=1 (response)
+    response[3] = (response[3] & 0xF0) | 3; // Set RCODE=3 (NXDOMAIN)
+    sendto(sockfd, response, len, 0, (struct sockaddr *)client_addr, addr_len);
+}
+
 // main function
 int main(int argc, char *argv[]) {
     char *dst_ip = NULL;
-    char *denylist_file = NULL;
+    char *deny_list_file = NULL;
     char *log_file = NULL;
-    char *doh_url = NULL;
+    char *doh_server = NULL;
     int use_doh = 0;
     int opt;
 
     static struct option long_options[] = {
+        {"help", no_argument, 0, 'h'},
         {"doh", no_argument, 0, 0},
-        {"doh_url", required_argument, 0, 0},
+        {"doh_server", required_argument, 0, 0},
         {0, 0, 0, 0}
     };
 
-    while((opt = getopt_long(argc, argv, "d:f:l:", long_options, NULL)) != -1) {
+    while((opt = getopt_long(argc, argv, "d:f:l:h", long_options, NULL)) != -1) {
         switch(opt) {
+            case 'h':
+                printf("usage: dns_forwarder.py [-h] [-d DST_IP] -f DENY_LIST_FILE [-l LOG_FILE] [--doh] [--doh_server DOH_SERVER]\n");
+                printf("optional arguments:\n");
+                printf("  -h, --help                                Display this help message\n");
+                printf("  -d                DST_IP                  Destination DNS Server IP\n");
+                printf("  -f                DENY_LIST_FILE          File containing domains to block\n");
+                printf("  -l                LOG_FILE                Append-only log file\n");
+                printf("  --doh                                     Use default upstream DoH server\n");
+                printf("  --doh_server      DOH_SERVER              Use this upstream DoH server\n");
+                exit(EXIT_SUCCESS);
             case 0:
                 if (strcmp(long_options[optind - 1].name, "doh") == 0) {
                     use_doh = 1;
-                } else if (strcmp(long_options[optind - 1].name, "doh_url") == 0) {
-                    doh_url = optarg;
+                } else if (strcmp(long_options[optind - 1].name, "doh_server") == 0) {
+                    use_doh = 1;
+                    doh_server = optarg;
                 }
                 break;
             case 'd':
                 dst_ip = optarg;
                 break;
             case 'f':
-                denylist_file = optarg;
+                deny_list_file = optarg;
                 break;
             case 'l':
                 log_file = optarg;
                 break;
             default:
-                fprintf(stderr, "Usage: %s [--doh] [--doh_url URL] [-d DST_IP] [-f denylist_file] [-l log_file]\n", argv[0]);
+                printf("usage: dns_forwarder.py [-h] [-d DST_IP] -f DENY_LIST_FILE [-l LOG_FILE] [--doh] [--doh_server DOH_SERVER]\n");
+                printf("optional arguments:\n");
+                printf("  -h, --help                                Display this help message\n");
+                printf("  -d                DST_IP                  Destination DNS Server IP\n");
+                printf("  -f                DENY_LIST_FILE          File containing domains to block\n");
+                printf("  -l                LOG_FILE                Append-only log file\n");
+                printf("  --doh                                     Use default upstream DoH server\n");
+                printf("  --doh_server      DOH_SERVER              Use this upstream DoH server\n");
                 exit(EXIT_FAILURE);
         } // switch
     } // while
 
-    if (!denylist_file) {
-        fprintf(stderr, "No deenylist file!\n");
+    if (!deny_list_file) {
+        fprintf(stderr, "Error: -f DENY_LIST_FILE is required.\n");
+        exit(EXIT_FAILURE);
     } // if
 
+    if (!use_doh && !dst_ip) {
+        fprintf(stderr, "Error: must specify -d DST_IP if not using DoH.\n");
+        return 1;
+    } // if
+    
+    if (use_doh && !doh_server) {
+        doh_server = strdup(DEFAULT_DOH_SERVER);
+    }
+
     char denylist[100][256];
-    int deny_count = load_deny_list(denylist_file, denylist, 100);
+    int deny_count = load_deny_list(deny_list_file, denylist, 100);
     printf("Loaded %d domains from denylist\n", deny_count);
 
     for (int i = 0; i < deny_count; i++) {
         printf("Denied: %s\n", denylist[i]);
     } // for
 
-    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sockfd < 0) {
-        perror("socket");
-        exit(EXIT_FAILURE);
-    } // if
-    printf("UDP socket created\n");
-
+    int sockfd;
     struct sockaddr_in server_addr, client_addr;
-    socklen_t client_len = sizeof(client_addr);
+    socklen_t addr_len = sizeof(client_addr);
+    unsigned char buffer[BUF_SIZE], response[BUF_SIZE];
+    int len, resp_len;
 
+    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(0);
+    server_addr.sin_addr.s_addr = INADDR_ANY;
 
     if (bind(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
         perror("bind");
-        close(sockfd);
-        exit(EXIT_FAILURE);
-    } // if
+        exit(1);
+    }
 
-    socklen_t addr_len = sizeof(server_addr);
-    if (getsockname(sockfd, (struct sockaddr *)&server_addr, &addr_len) < 0) {
-        perror("getsockname");
-        close(sockfd);
-        exit(EXIT_FAILURE);
-    } // if
-    printf("Socket bound to port %d\n", ntohs(server_addr.sin_port));
+    printf("DNS forwarder running on UDP port %d\n", ntohs(server_addr.sin_port));
 
-    unsigned char buffer[BUFFER_SIZE];
-    char domain[256];
-
-    printf("DNS Forwarder started. Listening for queries...\n");
     while (1) {
-        int recv_len = recvfrom(sockfd, buffer, BUFFER_SIZE, 0, (struct sockaddr *)&client_addr, &client_len);
-
-        if (recv_len < 0) {
-            perror("recvfrom");
+        len = recvfrom(sockfd, buffer, sizeof(buffer), 0, (struct sockaddr *)&client_addr, &addr_len);
+        if (len < 0)
             continue;
-        } // if
 
-        memset(domain, 0, sizeof(domain));
-        parse_qname(buffer, domain);
-        printf("Received query for domain: %s\n", domain);
+        // Extract domain name
+        char domain[256] = {0};
+        int pos = 12, j = 0, l;
+        while ((l = buffer[pos++]) && pos < len) {
+            memcpy(domain + j, buffer + pos, l);
+            j += l;
+            domain[j++] = '.';
+            pos += l;
+        }
+        domain[j - 1] = '\0';
 
-        if (is_domain_denied(domain, denylist, deny_count)) {
-            printf("Domain %s is denied. Dropping query.\n", domain);
-            buffer[2] |= 0x81; // Set RCODE to 3 (Name Error)
-            buffer[3] |= 0x03;
-            sendto(sockfd, buffer, recv_len, 0, (struct sockaddr *)&client_addr, client_len);
+        // Check blocklist
+        int blocked = 0;
+        for (int i = 0; i < deny_count; i++) {
+            if (strcasecmp(domain, denylist[i]) == 0) {
+                blocked = 1;
+                break;
+            }
+        }
+
+        if (blocked) {
+            printf("Blocked: %s\n", domain);
+            send_nxdomain(sockfd, &client_addr, addr_len, buffer, len);
             continue;
-        } // if
+        }
 
-        printf("Forwarding query for domain: %s\n", domain);
-    } // while
+        if (use_doh) {
+            const char *host = doh_server ? doh_server : DEFAULT_DOH_SERVER;
+            if (send_doh_query(buffer, len, response, &resp_len, host, DEFAULT_DOH_PATH, DEFAULT_DOH_PORT) == 0) {
+                sendto(sockfd, response, resp_len, 0, (struct sockaddr *)&client_addr, addr_len);
+            } else {
+                fprintf(stderr, "DoH query failed\n");
+            }
+        } else {
+            int fd = socket(AF_INET, SOCK_DGRAM, 0);
+            struct sockaddr_in resolver_addr = {0};
+            resolver_addr.sin_family = AF_INET;
+            resolver_addr.sin_port = htons(0);
+            inet_pton(AF_INET, dst_ip, &resolver_addr.sin_addr);
+
+            sendto(fd, buffer, len, 0, (struct sockaddr *)&resolver_addr, sizeof(resolver_addr));
+            resp_len = recvfrom(fd, response, sizeof(response), 0, NULL, NULL);
+            if (resp_len > 0)
+                sendto(sockfd, response, resp_len, 0, (struct sockaddr *)&client_addr, addr_len);
+            close(fd);
+        }
+    }
+
     close(sockfd);
     return 0;
 } // main
