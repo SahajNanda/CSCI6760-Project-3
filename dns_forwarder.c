@@ -21,6 +21,7 @@
 #define DEFAULT_DOH_SERVER "cloudflare-dns.com"
 #define DEFAULT_DOH_PATH "/dns-query"
 #define DEFAULT_DOH_PORT "443"
+#define DNS_PORT 38000
 #define TEST_PORT 5300  // Non-privileged port for testing
 
 // base64url encoding
@@ -267,7 +268,7 @@ int main(int argc, char *argv[]) {
     sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(0);
+    server_addr.sin_port = htons(DNS_PORT);
     server_addr.sin_addr.s_addr = INADDR_ANY;
 
     if (bind(sockfd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
@@ -275,7 +276,7 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-    printf("DNS forwarder running on UDP port %d\n", ntohs(server_addr.sin_port));
+printf("DNS forwarder running on UDP port %d\n", DNS_PORT);
 
     while (1) {
         len = recvfrom(sockfd, buffer, sizeof(buffer), 0, (struct sockaddr *)&client_addr, &addr_len);
@@ -319,7 +320,7 @@ int main(int argc, char *argv[]) {
             int fd = socket(AF_INET, SOCK_DGRAM, 0);
             struct sockaddr_in resolver_addr = {0};
             resolver_addr.sin_family = AF_INET;
-            resolver_addr.sin_port = htons(0);
+            resolver_addr.sin_port = htons(53);
             inet_pton(AF_INET, dst_ip, &resolver_addr.sin_addr);
 
             sendto(fd, buffer, len, 0, (struct sockaddr *)&resolver_addr, sizeof(resolver_addr));
