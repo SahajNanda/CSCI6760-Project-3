@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #include <getopt.h>
 #include <arpa/inet.h>
@@ -23,6 +24,8 @@
 #define DEFAULT_DOH_PORT "443"
 #define DNS_PORT 38000
 #define TEST_PORT 5300  // Non-privileged port for testing
+
+FILE *log_fp = NULL;  // log file pointer
 
 // base64url encoding
 void base64url_encode(const unsigned char *input, int length, char *output) {
@@ -70,6 +73,27 @@ int is_domain_denied(const char *domain, char denylist[][256], int deny_count) {
     } // for
     return 0;
 } // is_domain_denied
+
+// log query to log file
+void log_query(const char *domain, const char *type, const char *status) {
+    if (log_fp) {
+        fprintf(log_fp, "%s %s %s\n", domain, type, status);
+        fflush(log_fp);
+    } // if
+} // log_query
+
+//
+unsigned short get_qtype(const unsigned char *buffer, int len) {
+    int pos = 12; // Skip DNS header
+    while (pos < len && buffer[pos] != 0) {
+        pos += buffer[pos] + 1;
+    } // while
+    pos++; // Skip null byte
+    if (pos + 2 <= len) {
+        return ntohs(*(unsigned short *)(buffer + pos));
+    } // if
+    return 1; // Default to A record
+} // get_qtype
 
 // parse QNAME from DNS query
 int parse_qname(const unsigned char *dns_query, char *domain) {
@@ -255,6 +279,12 @@ int main(int argc, char *argv[]) {
     int deny_count = load_deny_list(deny_list_file, denylist, 100);
     printf("Loaded %d domains from denylist\n", deny_count);
 
+    log_fp = fopen(log_file, "a");
+    if (!log_fp) {
+        perror("fopen log file");
+        exit(EXIT_FAILURE);
+    } // if
+
     for (int i = 0; i < deny_count; i++) {
         printf("Denied: %s\n", denylist[i]);
     } // for
@@ -276,7 +306,7 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-printf("DNS forwarder running on UDP port %d\n", DNS_PORT);
+    printf("DNS forwarder running on UDP port %d\n", DNS_PORT);
 
     while (1) {
         len = recvfrom(sockfd, buffer, sizeof(buffer), 0, (struct sockaddr *)&client_addr, &addr_len);
@@ -303,9 +333,23 @@ printf("DNS forwarder running on UDP port %d\n", DNS_PORT);
             }
         }
 
+        unsigned short qtype_num = get_qtype(buffer, len);
+        char qtype[10];
+
+        switch (qtype_num) {
+            case 1: strcpy(qtype, "A"); break;
+            case 2: strcpy(qtype, "NS"); break;
+            case 5: strcpy(qtype, "CNAME"); break;
+            case 15: strcpy(qtype, "MX"); break;
+            case 16: strcpy(qtype, "TXT"); break;
+            case 28: strcpy(qtype, "AAAA"); break;
+            default: strcpy(qtype, "OTHER"); break;
+        } // switch
+
         if (blocked) {
             printf("Blocked: %s\n", domain);
             send_nxdomain(sockfd, &client_addr, addr_len, buffer, len);
+            log_query(domain, qtype, "DENY");
             continue;
         }
 
@@ -313,6 +357,8 @@ printf("DNS forwarder running on UDP port %d\n", DNS_PORT);
             const char *host = doh_server ? doh_server : DEFAULT_DOH_SERVER;
             if (send_doh_query(buffer, len, response, &resp_len, host, DEFAULT_DOH_PATH, DEFAULT_DOH_PORT) == 0) {
                 sendto(sockfd, response, resp_len, 0, (struct sockaddr *)&client_addr, addr_len);
+                printf("Forwarded via DoH: %s\n", domain);
+                log_query(domain, qtype, "ALLOW");
             } else {
                 fprintf(stderr, "DoH query failed\n");
             }
@@ -325,12 +371,16 @@ printf("DNS forwarder running on UDP port %d\n", DNS_PORT);
 
             sendto(fd, buffer, len, 0, (struct sockaddr *)&resolver_addr, sizeof(resolver_addr));
             resp_len = recvfrom(fd, response, sizeof(response), 0, NULL, NULL);
-            if (resp_len > 0)
+            if (resp_len > 0) {
                 sendto(sockfd, response, resp_len, 0, (struct sockaddr *)&client_addr, addr_len);
+                log_query(domain, qtype, "ALLOW");
+                printf("Forwarded via UDP: %s\n", domain);
+            }
             close(fd);
         }
     }
 
     close(sockfd);
+    fclose(log_fp);
     return 0;
 } // main
