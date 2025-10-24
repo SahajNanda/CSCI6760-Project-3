@@ -19,11 +19,10 @@
 #include <fcntl.h>
 
 #define BUF_SIZE 8192
-#define DEFAULT_DOH_SERVER "cloudflare-dns.com"
+#define DEFAULT_DOH_SERVER "9.9.9.9"
 #define DEFAULT_DOH_PATH "/dns-query"
 #define DEFAULT_DOH_PORT "443"
-#define DNS_PORT 38000
-#define TEST_PORT 5300  // Non-privileged port for testing
+#define DNS_PORT 53
 
 FILE *log_fp = NULL;  // log file pointer
 
